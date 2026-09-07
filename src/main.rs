@@ -1,4 +1,5 @@
 use std::fs;
+use std::collections::HashMap;
 use std::io::{Read, Write, BufReader, BufRead};
 use std::net::{TcpListener, TcpStream};
 
@@ -21,10 +22,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
 fn handle_request(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>>{
     
     //Create reader to read the buffer stream
-    let reader = BufReader::new(&mut stream);
+    let mut reader = BufReader::new(&mut stream);
     
     //Get start line
-    let request: String = reader.lines().next().unwrap().unwrap();
+    let request: String = (&mut reader).lines().next().unwrap().unwrap();
+
+    let header: HashMap<String, String> = (&mut reader).lines().map(|section| section.unwrap()).map_while(|line| {
+        if line.is_empty() {
+            None
+        } else {
+            let sect = line.split_once(':').unwrap();
+            let pairs = {
+                let (k, v) = sect;
+                (k.to_string().to_lowercase(), v.trim().to_string())
+            };
+
+            Some(pairs)
+        }
+    })
+        .collect();
+    
+    println!("{:#?}", header);
 
     let start_line;
     let cont_len: usize;
