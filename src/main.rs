@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{Read, Write, BufReader, BufRead};
 use std::net::{TcpListener, TcpStream};
 
@@ -15,12 +16,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
         
         //Get start line
         let request: String = reader.lines().next().unwrap().unwrap();
-        
-        //Match request type
-        let message: String = match &request[..]{
-            "GET / HTTP/1.1" => format!("HTTP/1.1 200 OK\r\n\r\n"),
-            _ => format!("HTTP/1.1 404 NOT FOUND\r\n\r\n"),
-        };
+
+        let start_line;
+        let cont_len: usize;
+        let html: String;
+
+        match &request[..] {
+            "GET / HTTP/1.1" => {
+                start_line = "HTTP/1.1 200 OK";
+                html = fs::read_to_string("page.html").expect("Failed to read page.html");
+                cont_len = html.len();
+            },
+            _ => {
+                start_line = "HTTP/1.1 404 NOT FOUND";
+                html = fs::read_to_string("error.html").expect("Failed to read error.html");
+                cont_len = html.len();
+            }
+        }
+
+        let message = format!("{start_line}\r\nContent-Length: {cont_len}\r\n\r\n{html}");
+
 
         stream.write_all(&message.into_bytes())?;
 
