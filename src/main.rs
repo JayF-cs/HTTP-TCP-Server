@@ -1,83 +1,20 @@
-use std::fs;
-use std::collections::HashMap;
-use std::io::{Read, Write, BufReader, BufRead};
 use std::net::{TcpListener, TcpStream};
+use http_server::{handle_request, thread_pool::ThreadPool};
 
 fn main() -> Result<(), Box<dyn std::error::Error>>{
     
     //Make listener on port 8080
     let listener: TcpListener = TcpListener::bind("127.0.0.1:8080").unwrap();
+    let tp: ThreadPool = ThreadPool::build(4);
     
     for stream in listener.incoming(){
         //Get TcpStream instance
         let mut stream = stream.unwrap();
 
         //Handle the request
-        handle_request(stream);        
+        tp.execute(stream);
     }
 
     Ok(())
 }
 
-fn handle_request(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>>{
-    
-    //Create reader to read the buffer stream
-    let mut reader = BufReader::new(&mut stream);
-    
-    //Get start line
-    let request: String = (&mut reader).lines().next().unwrap().unwrap();
-
-    let header: HashMap<String, String> = (&mut reader).lines().map(|section| section.unwrap()).map_while(|line| {
-        if line.is_empty() {
-            None
-        } else {
-            let sect = line.split_once(':').unwrap();
-            let pairs = {
-                let (k, v) = sect;
-                (k.to_string().to_lowercase(), v.trim().to_string())
-            };
-
-            Some(pairs)
-        }
-    })
-        .collect();
-    
-    println!("{:#?}", header);
-
-    let start_line;
-    let cont_len: usize;
-    let html: String;
-
-    match &request[..] {
-        "GET / HTTP/1.1" => {
-            start_line = "HTTP/1.1 200 OK";
-            html = fs::read_to_string("page.html").expect("Failed to read page.html");
-            cont_len = html.len();
-        },
-        _ => {
-            start_line = "HTTP/1.1 404 NOT FOUND";
-            html = fs::read_to_string("error.html").expect("Failed to read error.html");
-            cont_len = html.len();
-        }
-    }
-
-    let message = format!("{start_line}\r\nContent-Length: {cont_len}\r\n\r\n{html}");
-
-
-    stream.write_all(&message.into_bytes())?;
-
-    Ok(())
-}
-
-fn read_request<R: BufRead>(reader: R){
-    //Read entire request
-    let request: Vec<_> = reader.lines()
-        .map(|res| res.unwrap())
-        .take_while(|line| !line.is_empty())
-        .collect();
-
-    for line in &request{
-        println!("{}", line);
-    }
-
-}
