@@ -5,13 +5,13 @@ use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::{Arc, Mutex};
 
 
+
 pub struct ThreadPool{
     //Have a vector to hold worker
     pool: Vec<T_Worker>,
     //Sender end of channel to send TcpStream objects
-    sender: Sender<TcpStream>,
+    sender: Option<Sender<TcpStream>>,
     //Size of vector cause I guess
-    max: usize,
 }
 
 pub struct T_Worker {
@@ -29,11 +29,16 @@ impl T_Worker {
         //Spawn thread have it constantly look for a job using receiver
         let t = thread::spawn(move || {
             loop {
-                let job = rec.lock().unwrap().recv().unwrap();
-                handle_request(job);
+                let job = rec.lock().unwrap().recv();
 
+                match job {
+
+                    Ok(job) => { let _ = handle_request(job); },
+                    Err(_) => break,
                 }
-            });
+
+            }
+        });
 
         //Intialize and return worker
         Self {
@@ -59,16 +64,28 @@ impl ThreadPool {
         //Make and return instance of thread pool
         Self {
             pool: (0..t_num).map(|_| T_Worker::new(Arc::clone(&receiver))).collect(),
-            sender: s,
-            max: t_num,
+            sender: Some(s),
         }
 
     }
     
     //Send TcpStream object down channel for threads
     pub fn execute(&self, stream: TcpStream) {
-        self.sender.send(stream).unwrap();
+        self.sender.as_ref().unwrap().send(stream).unwrap();
     }
 
+}
 
+impl Drop for ThreadPool {
+
+    fn drop(&mut self) {
+        
+        if let Some(sender) = self.sender.take() {
+            drop(sender);
+        };
+
+        for thr in self.pool.drain(..) {
+            thr.worker.join().unwrap();
+        }
+    }
 }

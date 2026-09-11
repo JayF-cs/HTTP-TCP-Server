@@ -1,7 +1,7 @@
 pub mod thread_pool;
 use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write, BufReader, BufRead};
+use std::net::{TcpStream};
+use std::io::{Write, BufReader, BufRead};
 use std::fs;
 
 pub fn handle_request(mut stream: TcpStream) -> Result<(), Box<dyn std::error::Error>>{
