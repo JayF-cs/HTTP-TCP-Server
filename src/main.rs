@@ -13,22 +13,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
 
     //Clone will be given to ctrlc so main thread maintains ownership of value
     let r = running.clone();
-
+    
+    //Set handler for Ctrl + c
     ctrlc::set_handler(move || {r.store(false, Ordering::SeqCst);})?;
 
     //Make listener on port 8080
     let listener: TcpListener = TcpListener::bind("127.0.0.1:8080").unwrap();
     listener.set_nonblocking(true).expect("Cannot set non-blocking");
 
-
+    //Make threadpool
     let tp: ThreadPool = ThreadPool::build(4);
     
+    //Go through all incoming streams
     for stream in listener.incoming(){
-        //Get TcpStream instance
+        //Check if running flag is still set, if not break out loop
         if !running.load(Ordering::SeqCst) {
             break;
         }
+        
 
+        //Check if stream is valid or if still waiting for a request to come through
         match stream {
             Ok(s) => {
                 //Handle the request

@@ -76,14 +76,16 @@ impl ThreadPool {
 
 }
 
+//Implement Drop trait for ThreadPool
 impl Drop for ThreadPool {
-
+    
     fn drop(&mut self) {
-        
+        //Drop sender channel so no more request can be taken by thread
         if let Some(sender) = self.sender.take() {
             drop(sender);
         };
-
+        
+        //Join worker threads
         for thr in self.pool.drain(..) {
             thr.worker.join().unwrap();
         }
