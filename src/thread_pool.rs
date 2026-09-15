@@ -1,6 +1,6 @@
 use std::thread::{self, JoinHandle, ThreadId};
 use std::net::{TcpStream};
-use crate::handle_request;
+use crate::*;
 use std::sync::mpsc::{self, Sender, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -24,7 +24,7 @@ pub struct T_Worker {
 //Thread worker functions
 impl T_Worker {
     //Pass copy of receiver to thread that way the can listen for job
-    pub fn new(rec: Arc<Mutex<Receiver<TcpStream>>>) -> Self {
+    pub fn new(rec: Arc<Mutex<Receiver<TcpStream>>>, table: Arc<HashMap<(Method, &'static str), fn(&Request) -> Response>>) -> Self {
         
         //Spawn thread have it constantly look for a job using receiver
         let t = thread::spawn(move || {
@@ -33,7 +33,7 @@ impl T_Worker {
 
                 match job {
 
-                    Ok(job) => { let _ = handle_request(job); },
+                    Ok(job) => { let _ = handle_request(job, Arc::clone(&table)); },
                     Err(_) => break,
                 }
 
@@ -52,7 +52,7 @@ impl T_Worker {
 impl ThreadPool {
     
     //Make thread pool instance
-    pub fn build(t_num: usize) -> Self{
+    pub fn build(t_num: usize, table: Arc<HashMap<(Method, &'static str), fn(&Request) -> Response>>) -> Self{
         //Make sure not zero threads small amount
         if t_num == 0 || t_num > 10 {
             panic!("Cannot have that number of threads");
@@ -63,7 +63,7 @@ impl ThreadPool {
         let receiver = Arc::new(Mutex::new(r));        
         //Make and return instance of thread pool
         Self {
-            pool: (0..t_num).map(|_| T_Worker::new(Arc::clone(&receiver))).collect(),
+            pool: (0..t_num).map(|_| T_Worker::new(Arc::clone(&receiver), Arc::clone(&table))).collect(),
             sender: Some(s),
         }
 

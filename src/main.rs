@@ -1,6 +1,7 @@
 use ctrlc;
 use std::net::{TcpListener};
-use http_server::{thread_pool::ThreadPool};
+use http_server::thread_pool::ThreadPool;
+use http_server::{route_table};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,16 +22,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
     let listener: TcpListener = TcpListener::bind("127.0.0.1:8080").unwrap();
     listener.set_nonblocking(true).expect("Cannot set non-blocking");
 
+    //Make dispatch table
+    let routes = route_table();
+    let rt = Arc::clone(&routes);
+
     //Make threadpool
-    let tp: ThreadPool = ThreadPool::build(4);
-    
+    let tp: ThreadPool = ThreadPool::build(4, rt);
+
     //Go through all incoming streams
     for stream in listener.incoming(){
         //Check if running flag is still set, if not break out loop
         if !running.load(Ordering::SeqCst) {
             break;
         }
-        
 
         //Check if stream is valid or if still waiting for a request to come through
         match stream {
