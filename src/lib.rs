@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::net::{TcpStream};
 use std::io::{Write, BufReader, BufRead};
 use std::sync::Arc;
+use std::path::Path;
 use std::fs;
 
 #[derive(Eq, Hash, PartialEq, Copy, Clone)]
@@ -25,6 +26,7 @@ impl Method {
 pub enum Status {
     Ok,
     NotFound,
+    Created,
 }
 
 impl Status {
@@ -32,6 +34,7 @@ impl Status {
         match self {
             Status::Ok => 200,
             Status::NotFound => 404,
+            Status::Created => 201,
         }
     }
 
@@ -39,16 +42,17 @@ impl Status {
         match self {
             Status::Ok => "OK",
             Status::NotFound => "Not Found",
+            Status::Created => "Created",
         }
     }
 }
 
 pub struct Request {
-    method: Method,
-    path: String,
+    pub method: Method,
+    pub path: String,
     pub version: String,
     pub header: HashMap<String, String>,
-    body: Vec<u8>,
+    pub body: Vec<u8>,
 }
 
 pub struct Response {
@@ -81,11 +85,7 @@ pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'stati
             None => break,
         };
 
-        let response = match table.get(&(request.method, request.path.as_str())) {
-            
-            Some(handler) => handler(&request),
-            None => default_handler(&request),
-        };
+        let response = handle_request_dispatch(&request, &table);
         
         let start_line = format!("{} {} {}",request.version, response.status.status_num(), response.status.reason());
 
@@ -134,8 +134,63 @@ pub fn parse_request<r: BufRead>(reader: &mut r) -> Option<Request> {
         }
     })
         .collect();
-    
+    //if request.0 != Method::PUT {
     Some(Request {method: request.0, path: request.1, version: request.2, header, body: Vec::new()})
+    //} else {
+        //Not implemented yet
+    //}
+}
+
+pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'static str), fn(&Request) -> Response>) -> Response {
+    //Check if in dispatch table
+    if let Some(handler) = table.get(&(request.method, request.path.as_str())) {
+        return handler(request)
+    }
+    //Check if its requesting static file
+    if request.method == Method::GET && request.path.starts_with("/files/") {
+        return file_handling(request)
+    }
+    
+    //If none of the above then error 404
+    println!("Handle request default");
+    default_handler(request)
+}
+
+pub fn file_handling(req: &Request) -> Response {
+    
+    //Get file name after /
+    let file = &req.path["/files/".len()..];
+    
+    //Sanitize for .. or absolute paths
+    if file.contains("..") || file.starts_with("/") {
+        return default_handler(req);
+    }
+
+    let full_path = Path::new("root").join(file);
+
+    match fs::read(&full_path) {
+        Ok(body) => {
+            //Check keep connection alive
+            let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
+            let con_header = if close_conn { "close" } else { "keep-alive" };
+            let cont_type = content_type(&full_path);
+
+            //Make header
+            let header = [
+                ("Content-length", body.len().to_string()),
+                ("Connection", con_header.to_string()),
+                ("Content-type", cont_type.to_string()),
+            ].into_iter().collect();
+
+            //Return the response
+            Response { status: Status::Ok, header, body}
+        }
+        Err(_) => { 
+            println!("Match fs default {}", full_path.display());
+            default_handler(req) 
+        }
+    }
+
 
 }
 
@@ -152,9 +207,21 @@ pub fn read_request<r: BufRead>(reader: r){
 
 }
 
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("html") => "text/html",
+        Some("css") => "text/css",
+        Some("js") => "application/javascript",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("txt") => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
 pub fn get_handle_root(req: &Request) -> Response {
     
-    let html = fs::read_to_string("page.html").expect("Failed to read page.html");
+    let html = fs::read_to_string("root/page.html").expect("Failed to read page.html");
 
     let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
     let con_header = if close_conn { "close" } else { "keep-alive" }; 
@@ -170,7 +237,7 @@ pub fn get_handle_root(req: &Request) -> Response {
 }
 
 pub fn default_handler(req: &Request) -> Response {
-    let html = fs::read_to_string("error.html").expect("Failed to read page.html");
+    let html = fs::read_to_string("root/error.html").expect("Failed to read page.html");
 
     let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
     let con_header = if close_conn { "close" } else { "keep-alive" }; 
