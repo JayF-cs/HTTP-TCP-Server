@@ -1,7 +1,7 @@
 pub mod thread_pool;
 use std::collections::HashMap;
 use std::net::{TcpStream};
-use std::io::{Write, BufReader, BufRead};
+use std::io::{Write, BufReader, BufRead, Read};
 use std::sync::Arc;
 use std::path::Path;
 use std::fs;
@@ -61,6 +61,7 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
+//Route table
 pub fn route_table() -> Arc<HashMap<(Method, &'static str), fn(&Request) -> Response>> {
 
     let table: HashMap<(Method, &str), fn(&Request) -> Response> = [
@@ -73,6 +74,11 @@ pub fn route_table() -> Arc<HashMap<(Method, &'static str), fn(&Request) -> Resp
     Arc::new(table)
 }
 
+// Handle the request stream
+// Goes to parse request to determine request type
+// Passes to handle_request_dispatch which hands of to handler function that returns a Response
+// instance
+// Serialize response and write back to stream
 pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'static str), fn(&Request) -> Response>>) -> Result<(), Box<dyn std::error::Error>> {
     
     let mut writer = stream.try_clone()?;
@@ -111,11 +117,16 @@ pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'stati
     Ok(())
 }
 
+//Parse request into different sections
 pub fn parse_request<r: BufRead>(reader: &mut r) -> Option<Request> {
+    //Parse request line into different sections
     let request: (Method, String, String) = match reader.lines().next() {
         Some(Ok(line)) => {
             let mut parts = line.split_whitespace();
-            let req_type = Method::parse(parts.next().unwrap_or("")).unwrap();
+            let req_type = match Method::parse(parts.next().unwrap_or("")) {
+                Some(m) => m,
+                None => return None,
+            };
             let path = parts.next().unwrap_or("").to_string();
             let ver = parts.next().unwrap_or("").to_string();
             (req_type, path, ver)
@@ -134,13 +145,29 @@ pub fn parse_request<r: BufRead>(reader: &mut r) -> Option<Request> {
         }
     })
         .collect();
+    
+    //Read the body
+    //Check if content length is in header, then either get the length or fall to _ case
+    //If the length is 0 also fall through to _ case
+    //Otherwise create of Vec<u8> of size content length
+    //Use reader to read into the buffer and return that
+    let body = match header.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
+        Some(len) if len > 0 => {
+            let mut buf = vec![0u8; len];
+            reader.read_exact(&mut buf);
+            buf
+        }
+        _ => Vec::new(),
+    };
+        
     //if request.0 != Method::PUT {
-    Some(Request {method: request.0, path: request.1, version: request.2, header, body: Vec::new()})
+    Some(Request {method: request.0, path: request.1, version: request.2, header, body})
     //} else {
         //Not implemented yet
     //}
 }
 
+//Calls action based on request type and path
 pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'static str), fn(&Request) -> Response>) -> Response {
     //Check if in dispatch table
     if let Some(handler) = table.get(&(request.method, request.path.as_str())) {
@@ -150,13 +177,17 @@ pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'sta
     if request.method == Method::GET && request.path.starts_with("/files/") {
         return file_handling(request)
     }
+    if request.method == Method::POST && (request.path == "/upload" ||request.path.starts_with("/upload/")) {
+        return post_upload(request);
+    }
     
     //If none of the above then error 404
     println!("Handle request default");
     default_handler(request)
 }
 
-pub fn file_handling(req: &Request) -> Response {
+//Serves a file from root
+fn file_handling(req: &Request) -> Response {
     
     //Get file name after /
     let file = &req.path["/files/".len()..];
@@ -194,6 +225,58 @@ pub fn file_handling(req: &Request) -> Response {
 
 }
 
+fn post_upload(req: &Request) -> Response {
+
+    let Some(file) = extract_filename(req) else {
+        return default_handler(req);
+    };
+
+    if file.is_empty() || file.contains("..") || file.starts_with("/") {
+        return default_handler(req);
+    }
+
+    let full_path = Path::new("root").join(file);
+
+    let status = if full_path.exists() {
+        Status::Ok
+    } else {
+        Status::Created
+    };
+
+    match fs::write(&full_path, &req.body) {
+        Ok(()) => {
+            //Check keep connection alive
+            let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
+            let con_header = if close_conn { "close" } else { "keep-alive" };
+            
+            //Make header
+            let header = [
+                ("Content-length", "0".to_string()),
+                ("Connection", con_header.to_string()),
+            ].into_iter().collect();
+
+            //Return the response
+            Response { status, header, body: Vec::new()}
+        }
+        Err(_) => { 
+            println!("Match fs default {}", full_path.display());
+            default_handler(req) 
+        }
+
+    }
+
+}
+
+//Extract file path or just return the name in the header section
+fn extract_filename(req: &Request) -> Option<String> {
+    if let Some(res) = req.path.strip_prefix("/upload/") {
+        return Some(res.to_string())
+    }
+
+    req.header.get("x-filename").cloned()
+}
+
+//Just prints all incoming request
 pub fn read_request<r: BufRead>(reader: r){
     //read entire request
     let request: Vec<_> = reader.lines()
@@ -207,6 +290,7 @@ pub fn read_request<r: BufRead>(reader: r){
 
 }
 
+//Provides the content type of the file at given file path
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()) {
         Some("html") => "text/html",
