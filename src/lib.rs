@@ -1,11 +1,16 @@
 pub mod thread_pool;
 use std::collections::HashMap;
-use std::net::{TcpStream};
-use std::io::{Write, BufReader, BufRead, Read};
+use std::net::TcpStream;
+use std::io::{Write, BufReader, BufRead, Read, ErrorKind};
 use std::sync::Arc;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use flate2::{write::GzEncoder, Compression};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::time::Duration;
+
+const MAX_LINE: u64 = 8 * 1024;
+const MAX_HEADERS: usize = 100;
+const MAX_BODY: usize = 1024 * 1024;
 
 #[derive(Eq, Hash, PartialEq, Copy, Clone)]
 pub enum Method {
@@ -24,26 +29,45 @@ impl Method {
     }
 }
 
-pub enum Status {
-    Ok,
-    NotFound,
+pub enum ParseError { 
+    Closed, 
+    BadRequest, 
+    MethodNotAllowed, 
+    TooLarge 
+}
+
+pub enum Status { Ok,
     Created,
+    BadRequest,
+    NotFound,
+    MethodNotAllowed,
+    PayloadTooLarge,
+    InternalServerError
 }
 
 impl Status {
+
     fn status_num(&self) -> u16 {
         match self {
             Status::Ok => 200,
-            Status::NotFound => 404,
             Status::Created => 201,
+            Status::BadRequest => 400,
+            Status::NotFound => 404,
+            Status::MethodNotAllowed => 405,
+            Status::PayloadTooLarge => 413,
+            Status::InternalServerError => 500,
         }
     }
 
     fn reason(&self) -> &'static str {
         match self {
             Status::Ok => "OK",
-            Status::NotFound => "Not Found",
             Status::Created => "Created",
+            Status::BadRequest => "Bad Request",
+            Status::NotFound => "Not Found",
+            Status::MethodNotAllowed => "Method Not Allowed",
+            Status::PayloadTooLarge => "Payload Too Large",
+            Status::InternalServerError => "Internal Server Error",
         }
     }
 }
@@ -81,6 +105,9 @@ pub fn route_table() -> Arc<HashMap<(Method, &'static str), fn(&Request) -> Resp
 // instance
 // Serialize response and write back to stream
 pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'static str), fn(&Request) -> Response>>) -> Result<(), Box<dyn std::error::Error>> {
+
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     
     let mut writer = stream.try_clone()?;
     //Create reader to read the buffer stream
@@ -88,8 +115,17 @@ pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'stati
     loop {
         
         let request = match parse_request(&mut reader) {
-            Some(req) => req,
-            None => break,
+            Ok(req) => req,
+            Err(ParseError::Closed) => break,
+            Err(e) => {
+                let status = match e {
+                    ParseError::MethodNotAllowed => Status::MethodNotAllowed,
+                    ParseError::TooLarge => Status::PayloadTooLarge,
+                    _ => Status::BadRequest,
+                };
+                let _ = writer.write_all(&error_bytes(status));
+                break; // framing can't be trusted after a bad request
+            }
         };
 
         let response = handle_request_dispatch(&request, &table);
@@ -103,14 +139,13 @@ pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'stati
             .join("\r\n");
         
         //Make message
-        let partial_message = format!("{start_line}\r\n{header}\r\n\r\n");
-        let mut message = partial_message.into_bytes();
+        let mut message = format!("{start_line}\r\n{header}\r\n\r\n").into_bytes();
         message.extend_from_slice(&response.body);
         //Write back message
         writer.write_all(&message)?;
 
         //Check if keep connection open
-        if request.header.get("connection").map(|val| val == "close").unwrap_or(false) {
+        if is_close(&request) {
             break;
         }
     }
@@ -118,58 +153,53 @@ pub fn handle_request(mut stream: TcpStream, table: Arc<HashMap<(Method, &'stati
     Ok(())
 }
 
+
+fn read_line_limited<R: BufRead>(reader: &mut R) -> Result<String, ParseError> {
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take(MAX_LINE)
+        .read_until(b'\n', &mut buf)
+        .map_err(|_| ParseError::Closed)?;
+    if n == 0 { return Err(ParseError::Closed); }
+    if !buf.ends_with(b"\n") { return Err(ParseError::BadRequest); }
+    let line = String::from_utf8(buf).map_err(|_| ParseError::BadRequest)?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
 //Parse request into different sections
-pub fn parse_request<r: BufRead>(reader: &mut r) -> Option<Request> {
-    //Parse request line into different sections
-    let request: (Method, String, String) = match reader.lines().next() {
-        Some(Ok(line)) => {
-            let mut parts = line.split_whitespace();
-            let req_type = match Method::parse(parts.next().unwrap_or("")) {
-                Some(m) => m,
-                None => return None,
-            };
-            let path = parts.next().unwrap_or("").to_string();
-            let ver = parts.next().unwrap_or("").to_string();
-            (req_type, path, ver)
-        }
-        Some(Err(e)) => return None,
-        None => return None,
+pub fn parse_request<R: BufRead>(reader: &mut R) -> Result<Request, ParseError> {
 
-    };
+    let line = read_line_limited(reader)?;
+    let mut parts = line.split_whitespace();
+    let method = Method::parse(parts.next().ok_or(ParseError::BadRequest)?)
+        .ok_or(ParseError::MethodNotAllowed)?;
+    let path = parts.next().ok_or(ParseError::BadRequest)?.to_string();
+    let version = parts.next().ok_or(ParseError::BadRequest)?.to_string();
 
-    //parse header section into hashmap
-    let header: HashMap<String, String> = reader.lines().map(|section| section.unwrap()).map_while(|line| {
-        if line.is_empty() {
-            None
-        } else {
-            line.split_once(':').map(|(k,v)| {(k.to_string().to_lowercase(), v.trim().to_string())})
-        }
-    })
-        .collect();
-    
-    //Read the body
-    //Check if content length is in header, then either get the length or fall to _ case
-    //If the length is 0 also fall through to _ case
-    //Otherwise create of Vec<u8> of size content length
-    //Use reader to read into the buffer and return that
-    let body = match header.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
-        Some(len) if len > 0 => {
-            let mut buf = vec![0u8; len];
-            reader.read_exact(&mut buf);
-            buf
-        }
-        _ => Vec::new(),
+    let mut header = HashMap::new();
+    loop {
+        let line = read_line_limited(reader)?;
+        if line.is_empty() { break; }
+        if header.len() >= MAX_HEADERS { return Err(ParseError::BadRequest); }
+        let (k, v) = line.split_once(':').ok_or(ParseError::BadRequest)?;
+        header.insert(k.trim().to_lowercase(), v.trim().to_string());
+    }
+
+    let len = match header.get("content-length") {
+        Some(v) => v.parse::<usize>().map_err(|_| ParseError::BadRequest)?,
+        None => 0,
     };
-        
-    //if request.0 != Method::PUT {
-    Some(Request {method: request.0, path: request.1, version: request.2, header, body})
-    //} else {
-        //Not implemented yet
-    //}
+    if len > MAX_BODY { return Err(ParseError::TooLarge); }
+
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body).map_err(|_| ParseError::BadRequest)?;
+    Ok(Request { method, path, version, header, body })
 }
 
 //Calls action based on request type and path
 pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'static str), fn(&Request) -> Response>) -> Response {
+
     //Check if in dispatch table
     if let Some(handler) = table.get(&(request.method, request.path.as_str())) {
         return handler(request)
@@ -182,7 +212,7 @@ pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'sta
         return post_upload(request);
     }
     //Check if echoing a string
-    if request.method == Method::GET && (request.path == "/echo" || request.path.starts_with("/echo")) {
+    if request.method == Method::GET && (request.path == "/echo" || request.path.starts_with("/echo/")) {
         return echo_handling(request);
     }
     
@@ -198,11 +228,10 @@ fn file_handling(req: &Request) -> Response {
     let file = &req.path["/files/".len()..];
     
     //Sanitize for .. or absolute paths
-    if file.contains("..") || file.starts_with("/") {
-        return default_handler(req);
-    }
 
     let full_path = Path::new("root").join(file);
+
+    let Some(full_path) = safe_path(file) else { return default_handler(req); };
 
     match fs::read(&full_path) {
         Ok(body) => {
@@ -247,23 +276,29 @@ fn file_handling(req: &Request) -> Response {
 
 fn post_upload(req: &Request) -> Response {
 
-    let Some(file) = extract_filename(req, "/upload/") else {
-        return default_handler(req);
+    let Some(name) = req.path.strip_prefix("/upload/") else {
+        return error_response(req, Status::BadRequest);
     };
 
-    if file.is_empty() || file.contains("..") || file.starts_with("/") {
-        return default_handler(req);
+    if name.is_empty() || name.contains(['/', '\\']) || name == ".." || name == "." {
+        return error_response(req, Status::BadRequest);
     }
 
-    let full_path = Path::new("root").join(file);
-
-    let status = if full_path.exists() {
-        Status::Ok
-    } else {
-        Status::Created
+    let Ok(root) = Path::new("root").canonicalize() else {
+        return error_response(req, Status::InternalServerError);
     };
 
-    match fs::write(&full_path, &req.body) {
+    let full_path = root.join(name);
+    let (file, status) = match OpenOptions::new().write(true).create_new(true).open(&full_path) {
+        Ok(f) => (Ok(f), Status::Created),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => (
+            OpenOptions::new().write(true).truncate(true).open(&full_path),
+            Status::Ok,
+        ),
+        Err(e) => (Err(e), Status::Ok),
+    };
+
+    match file.and_then(|mut f| f.write_all(&req.body)) {
         Ok(()) => {
             //Check keep connection alive
             let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
@@ -288,11 +323,8 @@ fn post_upload(req: &Request) -> Response {
 }
 
 fn echo_handling(req: &Request) -> Response {
-    let Some(mut text) = extract_filename(req, "/echo/") else {
-        return default_handler(req);
-    };
-
-    let body: Vec<u8> = text.into_bytes(); 
+    let text = req.path.strip_prefix("/echo/").unwrap_or("");
+    let body: Vec<u8> = text.as_bytes().to_vec();
     
     let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
     let con_header = if close_conn { "close" } else { "keep-alive" };
@@ -323,15 +355,6 @@ fn echo_handling(req: &Request) -> Response {
 
     Response {status: Status::Ok, header, body}
 
-}
-
-//Extract file path or just return the name in the header section
-fn extract_filename(req: &Request, prefix: &str) -> Option<String> {
-    if let Some(res) = req.path.strip_prefix(prefix) {
-        return Some(res.to_string())
-    }
-
-    req.header.get("x-filename").cloned()
 }
 
 //Just prints all incoming request
@@ -383,6 +406,67 @@ fn gzip_encoding(body: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&body)?;
     encoder.finish()
+}
+
+fn safe_path(rel: &str) -> Option<PathBuf> {
+    let root = Path::new("root").canonicalize().ok()?;
+    let full = root.join(rel).canonicalize().ok()?;  // resolves .. and symlinks
+    full.starts_with(&root).then_some(full)
+}
+
+fn is_close(req: &Request) -> bool {
+    req.header
+        .get("connection")
+        .is_some_and(|v| v.eq_ignore_ascii_case("close"))
+}
+
+fn build_response(req: &Request, status: Status, body: Vec<u8>, ctype: Option<&'static str>, allow_gzip: bool) -> Response {
+    let wants_gzip = allow_gzip
+        && req
+            .header
+            .get("accept-encoding")
+            .is_some_and(|v| v.split(',').any(|e| e.trim().eq_ignore_ascii_case("gzip")));
+
+    let (body, gzipped) = if wants_gzip {
+        match gzip_encoding(&body) {
+            Ok(c) => (c, true),
+            Err(_) => (body, false),
+        }
+    } else {
+        (body, false)
+    };
+
+    let mut header = HashMap::new();
+    header.insert("Content-Length", body.len().to_string());
+    header.insert(
+        "Connection",
+        if is_close(req) { "close" } else { "keep-alive" }.to_string(),
+    );
+    if let Some(ct) = ctype {
+        header.insert("Content-Type", ct.to_string());
+    }
+    if gzipped {
+        header.insert("Content-Encoding", "gzip".to_string());
+    }
+    Response { status, header, body }
+}
+
+fn error_response(req: &Request, status: Status) -> Response {
+    let body = format!("{} {}\n", status.status_num(), status.reason()).into_bytes();
+    build_response(req, status, body, Some("text/plain"), false)
+}
+
+// For parse errors, where there's no Request yet
+fn error_bytes(status: Status) -> Vec<u8> {
+    let body = format!("{} {}\n", status.status_num(), status.reason());
+    format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+        status.status_num(),
+        status.reason(),
+        body.len(),
+        body
+    )
+    .into_bytes()
 }
 
 pub fn default_handler(req: &Request) -> Response {

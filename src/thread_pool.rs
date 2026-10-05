@@ -33,7 +33,12 @@ impl T_Worker {
 
                 match job {
 
-                    Ok(job) => { let _ = handle_request(job, Arc::clone(&table)); },
+                    Ok(job) => {
+                        let table = Arc::clone(&table);
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let _ = handle_request(job, table);
+                        }));
+                    },
                     Err(_) => break,
                 }
 

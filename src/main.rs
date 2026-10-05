@@ -40,6 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>{
         match stream {
             Ok(s) => {
                 //Handle the request
+                s.set_nonblocking(false)?;
                 tp.execute(s);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
