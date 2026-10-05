@@ -180,6 +180,10 @@ pub fn handle_request_dispatch(request: &Request, table: &HashMap<(Method, &'sta
     if request.method == Method::POST && (request.path == "/upload" ||request.path.starts_with("/upload/")) {
         return post_upload(request);
     }
+    //Check if echoing a string
+    if request.method == Method::GET && (request.path == "/echo" || request.path.starts_with("/echo")) {
+        return echo_handling(request);
+    }
     
     //If none of the above then error 404
     println!("Handle request default");
@@ -221,13 +225,11 @@ fn file_handling(req: &Request) -> Response {
             default_handler(req) 
         }
     }
-
-
 }
 
 fn post_upload(req: &Request) -> Response {
 
-    let Some(file) = extract_filename(req) else {
+    let Some(file) = extract_filename(req, "/upload/") else {
         return default_handler(req);
     };
 
@@ -260,16 +262,36 @@ fn post_upload(req: &Request) -> Response {
         }
         Err(_) => { 
             println!("Match fs default {}", full_path.display());
-            default_handler(req) 
+            default_handler(req)
         }
 
     }
 
 }
 
+fn echo_handling(req: &Request) -> Response {
+    let Some(text) = extract_filename(req, "/echo/") else {
+        return default_handler(req);
+    };
+    
+    let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
+    let con_header = if close_conn { "close" } else { "keep-alive" };
+    let cont_type = "text/plain";
+    let text_len = text.len();
+
+    let header = [
+        ("Content-length", text_len.to_string()),
+        ("Connection", con_header.to_string()),
+        ("Content-type", cont_type.to_string()),
+    ].into_iter().collect();
+
+    Response {status: Status::Ok, header, body: text.into_bytes()}
+
+}
+
 //Extract file path or just return the name in the header section
-fn extract_filename(req: &Request) -> Option<String> {
-    if let Some(res) = req.path.strip_prefix("/upload/") {
+fn extract_filename(req: &Request, prefix: &str) -> Option<String> {
+    if let Some(res) = req.path.strip_prefix(prefix) {
         return Some(res.to_string())
     }
 
