@@ -5,3 +5,4 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 [dependencies]
 ctrlc = "3.5"
+flate2 = "1.1.10"

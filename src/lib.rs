@@ -4,6 +4,7 @@ use std::net::{TcpStream};
 use std::io::{Write, BufReader, BufRead, Read};
 use std::sync::Arc;
 use std::path::Path;
+use flate2::{write::GzEncoder, Compression};
 use std::fs;
 
 #[derive(Eq, Hash, PartialEq, Copy, Clone)]
@@ -209,13 +210,30 @@ fn file_handling(req: &Request) -> Response {
             let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
             let con_header = if close_conn { "close" } else { "keep-alive" };
             let cont_type = content_type(&full_path);
+            let zip = req.header.get("accept-encoding")
+            .map(|val| val.split(',').any(|enc| enc.trim().eq_ignore_ascii_case("gzip")))
+            .unwrap_or(false);
 
+            let (body, gzipped) = if zip {
+                match gzip_encoding(&body) {
+                    Ok(compressed) => (compressed, true),
+                    Err(_) => (body, false),
+                }
+            } else {
+                (body, false)
+            };
+            
             //Make header
-            let header = [
+            let mut header: HashMap<&'static str, String> = [
                 ("Content-length", body.len().to_string()),
                 ("Connection", con_header.to_string()),
                 ("Content-type", cont_type.to_string()),
             ].into_iter().collect();
+
+            if gzipped {
+                header.insert("Content-Encoding", "gzip".to_string());
+            }
+
 
             //Return the response
             Response { status: Status::Ok, header, body}
@@ -270,22 +288,40 @@ fn post_upload(req: &Request) -> Response {
 }
 
 fn echo_handling(req: &Request) -> Response {
-    let Some(text) = extract_filename(req, "/echo/") else {
+    let Some(mut text) = extract_filename(req, "/echo/") else {
         return default_handler(req);
     };
+
+    let body: Vec<u8> = text.into_bytes(); 
     
     let close_conn = req.header.get("connection").map(|val| val == "close").unwrap_or(false);
     let con_header = if close_conn { "close" } else { "keep-alive" };
-    let cont_type = "text/plain";
-    let text_len = text.len();
+    let zip = req.header.get("accept-encoding")
+    .map(|val| val.split(',').any(|enc| enc.trim().eq_ignore_ascii_case("gzip")))
+    .unwrap_or(false);
 
-    let header = [
-        ("Content-length", text_len.to_string()),
+    let (body, gzipped) = if zip {
+        match gzip_encoding(&body) {
+            Ok(compressed) => (compressed, true),
+            Err(_) => (body, false),
+        }
+    } else {
+        (body, false)
+    };
+
+    let cont_type = "text/plain";
+    let body_len = body.len();
+    let mut header: HashMap<&'static str, String> = [
+        ("Content-length", body_len.to_string()),
         ("Connection", con_header.to_string()),
         ("Content-type", cont_type.to_string()),
     ].into_iter().collect();
 
-    Response {status: Status::Ok, header, body: text.into_bytes()}
+    if gzipped {
+        header.insert("Content-Encoding", "gzip".to_string());
+    }
+
+    Response {status: Status::Ok, header, body}
 
 }
 
@@ -340,6 +376,13 @@ pub fn get_handle_root(req: &Request) -> Response {
         .collect();
 
     Response { status: Status::Ok, header, body: html.into_bytes()}
+}
+
+fn gzip_encoding(body: &[u8]) -> std::io::Result<Vec<u8>> {
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&body)?;
+    encoder.finish()
 }
 
 pub fn default_handler(req: &Request) -> Response {
